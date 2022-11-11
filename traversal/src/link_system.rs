@@ -1,17 +1,36 @@
 use crate::blockstore::Blockstore;
-use anyhow::{anyhow, Result};
+use anyhow::Result;
+use async_trait::async_trait;
+use futures::io::copy;
 use integer_encoding::{VarIntReader, VarIntWriter};
-use libipld::cid::multihash::{Code, Multihash, MultihashDigest};
-use libipld::cid::Version;
+use libipld::cid::multihash::{Code, Error as MultihashError, Multihash, MultihashDigest};
+use libipld::cid::{Error as CidError, Version};
 use libipld::codec::{Codec, Decode, Encode};
 use libipld::codec_impl::IpldCodec;
+use libipld::error::{Error as IpldError, UnsupportedCodec};
 use libipld::{Cid, Ipld};
-use std::io::Cursor;
+use std::io::{Cursor, Error as IoError};
 use thiserror::Error;
 
 #[derive(Clone)]
 pub struct LinkSystem<BS> {
     bstore: BS,
+}
+
+#[derive(Error, Debug)]
+pub enum LinkError<S> {
+    #[error(transparent)]
+    Store(S),
+    #[error(transparent)]
+    Prefix(#[from] PrefixError),
+    #[error(transparent)]
+    Ipld(#[from] IpldError),
+    #[error(transparent)]
+    Codec(#[from] UnsupportedCodec),
+    #[error("Not Found: {0}")]
+    NotFound(Cid),
+    #[error(transparent)]
+    Io(#[from] IoError),
 }
 
 impl<BS> LinkSystem<BS>
@@ -21,23 +40,33 @@ where
     pub fn new(bstore: BS) -> Self {
         Self { bstore }
     }
-    pub fn store(&self, p: Prefix, n: &Ipld) -> Result<Cid> {
+    pub async fn store(&self, p: Prefix, n: &Ipld) -> Result<Cid, LinkError<BS::Error>> {
         let codec = IpldCodec::try_from(p.codec)?;
         let mut buf = Vec::new();
         Ipld::encode(n, codec, &mut buf)?;
         let cid = p.to_cid(&buf)?;
-        self.bstore.put_keyed(&cid, &buf)?;
+        self.bstore
+            .put_keyed(&cid, buf.as_ref() as &[u8])
+            .await
+            .map_err(LinkError::Store)?;
         Ok(cid)
     }
-    pub fn store_plus_raw(&self, p: Prefix, n: &Ipld) -> Result<(Cid, Vec<u8>)> {
+    pub async fn store_plus_raw(
+        &self,
+        p: Prefix,
+        n: &Ipld,
+    ) -> Result<(Cid, Vec<u8>), LinkError<BS::Error>> {
         let codec = IpldCodec::try_from(p.codec)?;
         let mut buf = Vec::new();
         Ipld::encode(n, codec, &mut buf)?;
         let cid = p.to_cid(&buf)?;
-        self.bstore.put_keyed(&cid, &buf)?;
+        self.bstore
+            .put_keyed(&cid, buf.as_ref() as &[u8])
+            .await
+            .map_err(LinkError::Store)?;
         Ok((cid, buf))
     }
-    pub fn compute_link(&self, p: Prefix, n: &Ipld) -> Result<Cid> {
+    pub async fn compute_link(&self, p: Prefix, n: &Ipld) -> Result<Cid, LinkError<BS::Error>> {
         let codec = IpldCodec::try_from(p.codec)?;
         let mut buf = Vec::new();
         Ipld::encode(n, codec, &mut buf)?;
@@ -46,41 +75,58 @@ where
     }
 }
 
+#[async_trait]
 pub trait BlockLoader {
-    fn load_plus_raw(&self, cid: Cid) -> Result<(Ipld, Vec<u8>)>;
+    type Error;
+    async fn load_plus_raw(&self, cid: Cid) -> Result<(Ipld, Vec<u8>), Self::Error>;
 }
 
+#[async_trait]
 impl<BS> BlockLoader for LinkSystem<BS>
 where
-    BS: Blockstore,
+    BS: Blockstore + Send + Sync,
+    BS::BlockData: Send,
+    BS::Error: Send,
 {
-    fn load_plus_raw(&self, cid: Cid) -> Result<(Ipld, Vec<u8>)> {
-        if let Some(blk) = self.bstore.get(&cid)? {
+    type Error = LinkError<BS::Error>;
+    async fn load_plus_raw(&self, cid: Cid) -> Result<(Ipld, Vec<u8>), Self::Error> {
+        if let Some(blk) = self.bstore.get(&cid).await.map_err(LinkError::Store)? {
             let codec = IpldCodec::try_from(cid.codec())?;
-            let node = codec.decode(&blk)?;
-            return Ok((node, blk));
+            let mut buffer: Vec<u8> = Vec::new();
+            copy(blk, &mut buffer).await?;
+            let node = codec.decode(&buffer)?;
+            return Ok((node, buffer));
         }
-        Err(anyhow!("not found"))
+        Err(LinkError::NotFound(cid))
     }
 }
 
+#[async_trait]
 pub trait IpldLoader {
-    fn load(&self, cid: Cid) -> Result<Ipld>;
+    async fn load(&self, cid: Cid) -> Result<Ipld, LoaderError>;
 }
 
+#[async_trait]
 impl<BS> IpldLoader for LinkSystem<BS>
 where
-    BS: Blockstore,
+    BS: Blockstore + Send + Sync,
+    BS::BlockData: Send,
+    BS::Error: std::fmt::Display + Send,
 {
-    fn load(&self, cid: Cid) -> Result<Ipld> {
+    async fn load(&self, cid: Cid) -> Result<Ipld, LoaderError> {
         let codec =
             IpldCodec::try_from(cid.codec()).map_err(|e| LoaderError::Codec(e.to_string()))?;
         if let Some(blk) = self
             .bstore
             .get(&cid)
+            .await
             .map_err(|e| LoaderError::Blockstore(e.to_string()))?
         {
-            let mut reader = Cursor::new(blk);
+            let mut buffer: Vec<u8> = Vec::new();
+            copy(blk, &mut buffer)
+                .await
+                .map_err(|e| LoaderError::Decoding(e.to_string()))?;
+            let mut reader = Cursor::new(buffer);
             return Ipld::decode(codec, &mut reader)
                 .map_err(|e| LoaderError::Decoding(e.to_string()).into());
         }
@@ -147,6 +193,14 @@ pub struct Prefix {
     pub mh_len: usize,
 }
 
+#[derive(Error, Debug)]
+pub enum PrefixError {
+    #[error(transparent)]
+    Multihash(#[from] MultihashError),
+    #[error(transparent)]
+    Cid(#[from] CidError),
+}
+
 impl Prefix {
     // default to cid v1 with default hash length
     pub fn new(codec: u64, mh_type: u64) -> Self {
@@ -192,7 +246,7 @@ impl Prefix {
         res
     }
 
-    pub fn to_cid(&self, data: &[u8]) -> Result<Cid> {
+    pub fn to_cid(&self, data: &[u8]) -> Result<Cid, PrefixError> {
         let hash: Multihash = Code::try_from(self.mh_type)?.digest(data);
         let cid = Cid::new(self.version, self.codec, hash)?;
         Ok(cid)
@@ -282,8 +336,8 @@ mod tests {
     use libipld::ipld;
 
     // same test as go-ipld-prime
-    #[test]
-    fn setup_from_blockstore() {
+    #[async_std::test]
+    async fn setup_from_blockstore() {
         let store = MemoryBlockstore::new();
         let lsys = LinkSystem::new(store);
 
@@ -297,9 +351,10 @@ mod tests {
             ),
             &value,
         )
+        .await
         .unwrap();
         let key: Cid = "bafyrgqhai26anf3i7pips7q22coa4sz2fr4gk4q4sqdtymvvjyginfzaqewveaeqdh524nsktaq43j65v22xxrybrtertmcfxufdam3da3hbk".parse().unwrap();
-        let n = lsys.load(key).unwrap();
+        let n = lsys.load(key).await.unwrap();
         assert_eq!(n, value);
     }
 }
