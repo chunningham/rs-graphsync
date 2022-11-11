@@ -1,11 +1,11 @@
-use anyhow::Result;
+use async_trait::async_trait;
+use futures::io::{copy, AsyncRead, Cursor};
 use libipld::{
-    cid::multihash::{self, MultihashDigest},
+    cid::multihash::{self, Multihash, MultihashDigest},
     Cid,
 };
 use std::{
     collections::HashMap,
-    rc::Rc,
     sync::{Arc, Mutex},
 };
 
@@ -15,7 +15,7 @@ use std::{
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct Block<D>
 where
-    D: AsRef<[u8]> + ?Sized,
+    D: AsyncRead + ?Sized,
 {
     pub codec: u64,
     pub data: D,
@@ -23,7 +23,7 @@ where
 
 impl<D> Block<D>
 where
-    D: AsRef<[u8]> + ?Sized,
+    D: AsyncRead + ?Sized,
 {
     pub fn new(codec: u64, data: D) -> Self
     where
@@ -32,43 +32,17 @@ where
     {
         Self { codec, data }
     }
-
-    pub fn cid(&self, mh_code: multihash::Code) -> Cid {
-        Cid::new_v1(self.codec, mh_code.digest(self.data.as_ref()))
-    }
-
-    pub fn len(&self) -> usize {
-        self.data.as_ref().len()
-    }
-}
-
-impl<D> AsRef<[u8]> for Block<D>
-where
-    D: AsRef<[u8]>,
-{
-    fn as_ref(&self) -> &[u8] {
-        self.data.as_ref()
-    }
-}
-
-impl<'a, D> From<&'a Block<D>> for Block<&'a [u8]>
-where
-    D: AsRef<[u8]>,
-{
-    fn from(b: &'a Block<D>) -> Self {
-        Block {
-            codec: b.codec,
-            data: b.data.as_ref(),
-        }
-    }
 }
 
 /// An IPLD blockstore suitable for injection into the FVM.
 ///
 /// The cgo blockstore adapter implements this trait.
+#[async_trait]
 pub trait Blockstore {
+    type BlockData: AsyncRead;
+    type Error;
     /// Gets the block from the blockstore.
-    fn get(&self, k: &Cid) -> Result<Option<Vec<u8>>>;
+    async fn get(&self, k: &Cid) -> Result<Option<Self::BlockData>, Self::Error>;
 
     /// Put a block with a pre-computed cid.
     ///
@@ -76,147 +50,104 @@ pub trait Blockstore {
     /// even if you provide it.
     ///
     /// If you _do_ already know the CID, use this method as some blockstores _won't_ recompute it.
-    fn put_keyed(&self, k: &Cid, block: &[u8]) -> Result<()>;
+    async fn put_keyed(&self, k: &Cid, block: impl AsyncRead + Send) -> Result<(), Self::Error>;
 
     /// Checks if the blockstore has the specified block.
-    fn has(&self, k: &Cid) -> Result<bool> {
-        Ok(self.get(k)?.is_some())
+    async fn has(&self, k: &Cid) -> Result<bool, Self::Error> {
+        Ok(self.get(k).await?.is_some())
     }
 
     /// Puts the block into the blockstore, computing the hash with the specified multicodec.
     ///
     /// By default, this defers to put.
-    fn put<D>(&self, mh_code: multihash::Code, block: &Block<D>) -> Result<Cid>
+    async fn put<D>(&self, mh_code: multihash::Code, block: Block<D>) -> Result<Cid, Self::Error>
     where
         Self: Sized,
-        D: AsRef<[u8]>,
-    {
-        let k = block.cid(mh_code);
-        self.put_keyed(&k, block.as_ref())?;
-        Ok(k)
-    }
+        D: AsyncRead + Send;
 
     /// Bulk put blocks into the blockstore.
-    fn put_many<D, I>(&self, blocks: I) -> Result<()>
+    async fn put_many<D, I>(&self, blocks: I) -> Result<(), Self::Error>
     where
         Self: Sized,
-        D: AsRef<[u8]>,
-        I: IntoIterator<Item = (multihash::Code, Block<D>)>,
+        D: AsyncRead + Send,
+        I: IntoIterator<Item = (multihash::Code, Block<D>)> + Send,
+        I::IntoIter: Send,
     {
-        self.put_many_keyed(blocks.into_iter().map(|(mc, b)| (b.cid(mc), b)))?;
+        for (c, b) in blocks {
+            self.put(c, b).await?;
+        }
         Ok(())
     }
 
     /// Bulk-put pre-keyed blocks into the blockstore.
     ///
     /// By default, this defers to put_keyed.
-    fn put_many_keyed<D, I>(&self, blocks: I) -> Result<()>
+    async fn put_many_keyed<D, I>(&self, blocks: I) -> Result<(), Self::Error>
     where
         Self: Sized,
-        D: AsRef<[u8]>,
-        I: IntoIterator<Item = (Cid, D)>,
+        D: AsyncRead + Send,
+        I: IntoIterator<Item = (Cid, D)> + Send,
+        I::IntoIter: Send,
     {
         for (c, b) in blocks {
-            self.put_keyed(&c, b.as_ref())?
+            self.put_keyed(&c, b).await?
         }
         Ok(())
     }
 
     /// Deletes the block for the given Cid key.
-    fn delete_block(&self, k: &Cid) -> Result<()>;
+    async fn delete_block(&self, k: &Cid) -> Result<(), Self::Error>;
 }
 
+#[async_trait]
 impl<BS> Blockstore for &BS
 where
-    BS: Blockstore,
+    BS: Blockstore + Sync,
 {
-    fn get(&self, k: &Cid) -> Result<Option<Vec<u8>>> {
-        (*self).get(k)
+    type BlockData = BS::BlockData;
+    type Error = BS::Error;
+    async fn get(&self, k: &Cid) -> Result<Option<Self::BlockData>, Self::Error> {
+        (*self).get(k).await
     }
 
-    fn put_keyed(&self, k: &Cid, block: &[u8]) -> Result<()> {
-        (*self).put_keyed(k, block)
+    async fn put_keyed(&self, k: &Cid, block: impl AsyncRead + Send) -> Result<(), Self::Error> {
+        (*self).put_keyed(k, block).await
     }
 
-    fn has(&self, k: &Cid) -> Result<bool> {
-        (*self).has(k)
+    async fn has(&self, k: &Cid) -> Result<bool, Self::Error> {
+        (*self).has(k).await
     }
 
-    fn delete_block(&self, k: &Cid) -> Result<()> {
-        (*self).delete_block(k)
+    async fn delete_block(&self, k: &Cid) -> Result<(), Self::Error> {
+        (*self).delete_block(k).await
     }
 
-    fn put<D>(&self, mh_code: multihash::Code, block: &Block<D>) -> Result<Cid>
+    async fn put<D>(&self, mh_code: multihash::Code, block: Block<D>) -> Result<Cid, Self::Error>
     where
         Self: Sized,
-        D: AsRef<[u8]>,
+        D: AsyncRead + Send,
     {
-        (*self).put(mh_code, block)
+        (*self).put(mh_code, block).await
     }
 
-    fn put_many<D, I>(&self, blocks: I) -> Result<()>
+    async fn put_many<D, I>(&self, blocks: I) -> Result<(), Self::Error>
     where
         Self: Sized,
-        D: AsRef<[u8]>,
-        I: IntoIterator<Item = (multihash::Code, Block<D>)>,
+        D: AsyncRead + Send,
+        I: IntoIterator<Item = (multihash::Code, Block<D>)> + Send,
+        I::IntoIter: Send,
     {
-        (*self).put_many(blocks)
+        (*self).put_many(blocks).await
     }
 
-    fn put_many_keyed<D, I>(&self, blocks: I) -> Result<()>
+    async fn put_many_keyed<D, I>(&self, blocks: I) -> Result<(), Self::Error>
     where
         Self: Sized,
-        D: AsRef<[u8]>,
-        I: IntoIterator<Item = (Cid, D)>,
+        D: AsyncRead + Send,
+        I: IntoIterator<Item = (Cid, D)> + Send,
+        I::IntoIter: Send,
     {
-        (*self).put_many_keyed(blocks)
-    }
-}
-
-impl<BS> Blockstore for Rc<BS>
-where
-    BS: Blockstore,
-{
-    fn get(&self, k: &Cid) -> Result<Option<Vec<u8>>> {
-        (**self).get(k)
-    }
-
-    fn put_keyed(&self, k: &Cid, block: &[u8]) -> Result<()> {
-        (**self).put_keyed(k, block)
-    }
-
-    fn has(&self, k: &Cid) -> Result<bool> {
-        (**self).has(k)
-    }
-
-    fn delete_block(&self, k: &Cid) -> Result<()> {
-        (**self).delete_block(k)
-    }
-
-    fn put<D>(&self, mh_code: multihash::Code, block: &Block<D>) -> Result<Cid>
-    where
-        Self: Sized,
-        D: AsRef<[u8]>,
-    {
-        (**self).put(mh_code, block)
-    }
-
-    fn put_many<D, I>(&self, blocks: I) -> Result<()>
-    where
-        Self: Sized,
-        D: AsRef<[u8]>,
-        I: IntoIterator<Item = (multihash::Code, Block<D>)>,
-    {
-        (**self).put_many(blocks)
-    }
-
-    fn put_many_keyed<D, I>(&self, blocks: I) -> Result<()>
-    where
-        Self: Sized,
-        D: AsRef<[u8]>,
-        I: IntoIterator<Item = (Cid, D)>,
-    {
-        (**self).put_many_keyed(blocks)
+        (*self).put_many_keyed(blocks).await
     }
 }
 
@@ -231,21 +162,54 @@ impl MemoryBlockstore {
     }
 }
 
+#[derive(thiserror::Error, Debug)]
+pub enum MemStoreError {
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error("Content Mismatch")]
+    ContentMismatch(Multihash),
+    #[error(transparent)]
+    Multihash(#[from] multihash::Error),
+}
+
+#[async_trait]
 impl Blockstore for MemoryBlockstore {
-    fn has(&self, k: &Cid) -> Result<bool> {
+    type BlockData = Cursor<Vec<u8>>;
+    type Error = MemStoreError;
+    async fn has(&self, k: &Cid) -> Result<bool, Self::Error> {
         Ok(self.blocks.lock().unwrap().contains_key(k))
     }
 
-    fn get(&self, k: &Cid) -> Result<Option<Vec<u8>>> {
-        Ok(self.blocks.lock().unwrap().get(k).cloned())
+    async fn get(&self, k: &Cid) -> Result<Option<Self::BlockData>, Self::Error> {
+        Ok(self.blocks.lock().unwrap().get(k).cloned().map(Cursor::new))
     }
 
-    fn put_keyed(&self, k: &Cid, block: &[u8]) -> Result<()> {
-        self.blocks.lock().unwrap().insert(*k, block.into());
+    async fn put<D>(&self, mh_code: multihash::Code, block: Block<D>) -> Result<Cid, Self::Error>
+    where
+        D: AsyncRead + Send,
+    {
+        let mut buffer: Vec<u8> = Vec::new();
+        copy(block.data, &mut buffer).await?;
+        let hash = mh_code.digest(&buffer);
+        let cid = Cid::new_v1(block.codec, hash);
+        self.blocks.lock().unwrap().insert(cid.clone(), buffer);
+        Ok(cid)
+    }
+
+    async fn put_keyed(&self, k: &Cid, block: impl AsyncRead + Send) -> Result<(), Self::Error> {
+        let mut buffer: Vec<u8> = Vec::new();
+        copy(block, &mut buffer).await?;
+        let code: multihash::Code = k.hash().code().try_into()?;
+        let hash = code.digest(&buffer);
+        if hash != *k.hash() {
+            return Err(MemStoreError::ContentMismatch(hash));
+        }
+
+        self.blocks.lock().unwrap().insert(*k, buffer);
         Ok(())
     }
 
-    fn delete_block(&self, k: &Cid) -> Result<()> {
+    async fn delete_block(&self, k: &Cid) -> Result<(), Self::Error> {
         self.blocks.lock().unwrap().remove(k);
         Ok(())
     }
